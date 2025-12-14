@@ -1,0 +1,7 @@
+Flask
+gunicorn
+opencv-python-headless
+mediapipe
+SpeechRecognition
+numpy
+Werkzeug
