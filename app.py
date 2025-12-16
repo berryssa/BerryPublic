@@ -1,4 +1,4 @@
-# unified_server.py - V12: DOĞRU ORIJINAL MANTIK + 120sn SURE
+# unified_server.py - V13: ESNEK VE KUSURSUZ MERHABA (TID)
 
 from flask import Flask, jsonify, request
 import cv2
@@ -13,15 +13,16 @@ import speech_recognition as sr
 app = Flask(__name__)
 
 # ==========================================
-# 1. BÖLÜM: JEST AYARLARI (SENİN ORİJİNAL KODUN)
+# 1. BÖLÜM: JEST AYARLARI 
 # ==========================================
 ROTATE_FIX = True       # Telefondan gelen görüntüyü düzelt
-SAVE_DEBUG = False      # Resim kaydetme YOK
+SAVE_DEBUG = False      # Resim kaydetme
 
-# --- HASSASİYET MANTIĞI ---
-PROXIMITY_THRESHOLD = 0.6  
-MIN_MOVEMENT = 20          
-STABLE_REQUIRED = 0.1      
+# --- YENİ HASSASİYET MANTIĞI ---
+# 0.6 -> 0.85: Elin, yüz yüksekliğinin %85'i kadar bir çapta (şakaklar dahil) olması yeterli.
+PROXIMITY_THRESHOLD = 0.85  
+# 20 -> 15: Daha ufak ve seri hareketleri algılaması için düşürüldü.
+MIN_MOVEMENT = 15           
 
 mp_face = mp.solutions.face_mesh
 mp_hands = mp.solutions.hands
@@ -53,7 +54,7 @@ def frame():
     if sid not in MOBILE_SESSIONS: return jsonify({"detected": False, "message": "Oturum Yok", "final": True})
     st = MOBILE_SESSIONS[sid]
 
-    # --- SADECE BURASI DEĞİŞTİ: 40 YERİNE 120 YAPILDI ---
+    # --- ZAMAN AŞIMI (120 sn) ---
     if time.time() - st["t0"] > 120:
         del MOBILE_SESSIONS[sid]
         return jsonify({"detected": False, "message": "Zaman Aşımı", "final": True})
@@ -67,8 +68,7 @@ def frame():
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
     msg = "Yüz/El Aranıyor..."
-    detected = False
-
+    
     with get_face() as fm, get_hands() as hm:
         f_res = fm.process(rgb)
         h_res = hm.process(rgb)
@@ -76,108 +76,106 @@ def frame():
         if f_res.multi_face_landmarks and h_res.multi_hand_landmarks:
             face = f_res.multi_face_landmarks[0]
             
-            # Yüz Referans Noktaları
+            # Yüz Referans Noktaları (Alın ve Çene)
             forehead = face.landmark[10]
             chin = face.landmark[152]
             face_height = calc_dist((forehead.x*w, forehead.y*h), (chin.x*w, chin.y*h))
             fx, fy = int(forehead.x * w), int(forehead.y * h)
 
-            # TÜM ELLERİ KONTROL ET
-            for hand in h_res.multi_hand_landmarks:
-                index_tip = hand.landmark[8]
-                wrist = hand.landmark[0]
+            # TÜM ELLERİ KONTROL ET (Sağ veya Sol fark etmez)
+            for i, hand in enumerate(h_res.multi_hand_landmarks):
+                
+                index_tip = hand.landmark[8]  # İşaret parmağı ucu
                 
                 ix, iy = int(index_tip.x * w), int(index_tip.y * h)
-                wx, wy = int(wrist.x * w), int(wrist.y * h)
-
-                is_upright = wy > iy 
+                
+                # El alına ne kadar yakın?
                 dist_to_forehead = calc_dist((ix, iy), (fx, fy))
+                
+                # Eşik Kontrolü: Yüz boyunun %85'i kadar yakın mı? (Şakaklar, kaş üstü vs.)
                 is_close_to_head = dist_to_forehead < (face_height * PROXIMITY_THRESHOLD)
 
+                # --- SENARYO 1: HAREKET BAŞLANGICI ---
                 if st["start_pos"] is None:
-                    st["start_pos"] = (ix, iy)
-                    st["stable_start"] = time.time()
-                    msg = "Hareketi Yap!"
+                    if is_close_to_head:
+                        st["start_pos"] = (ix, iy)
+                        msg = "Hazır! Hareketi Yap..."
+                        # Başlangıç anında elin konumunu kaydettik
+                    else:
+                        msg = "Elini Alnına/Başına Getir"
+                
+                # --- SENARYO 2: HAREKET ANALİZİ ---
                 else:
                     start_ix, start_iy = st["start_pos"]
-                    move_dist = calc_dist((ix, iy), (start_ix, start_iy))
-                    moved_up = iy < start_iy 
-
-                    msg = f"D:{dist_to_forehead:.0f}"
-
-                    if is_upright and is_close_to_head and move_dist > MIN_MOVEMENT:
-                        if moved_up:
-                            detected = True
-                            msg = "✅ Merhaba Algılandı!"
-                            print(f"✅ JEST BAŞARILI! (Alna Yakınlık: {dist_to_forehead:.0f})")
-                            del MOBILE_SESSIONS[sid]
-                            return jsonify({"detected": True, "message": msg, "final": True})
-                        else:
-                            msg = "Elini Kaldır"
                     
-                    elif not is_close_to_head:
-                        msg = "Elini Alnına Getir"
+                    # Ne kadar hareket etti?
+                    move_total = calc_dist((ix, iy), (start_ix, start_iy))
+                    
+                    # Yön Analizi
+                    diff_y = iy - start_iy  # Negatifse Yukarı, Pozitifse Aşağı
+                    diff_x = abs(ix - start_ix) # Yana açılma miktarı
+                    
+                    msg = f"Mesafe: {dist_to_forehead:.0f} Hareket: {move_total:.0f}"
+
+                    # KURAL: El önceden kafadaydı (start_pos doldu).
+                    # Şimdi el hareket ettiyse (MIN_MOVEMENT kadar)...
+                    if move_total > MIN_MOVEMENT:
+                        
+                        # Hareket Yönü Kontrolü:
+                        # 1. Yukarı çıkıyor mu? (diff_y < 0)
+                        # 2. VEYA Yana doğru (sağa/sola) açılıyor mu? (diff_x > MIN_MOVEMENT)
+                        # KISITLAMA: Sadece aşağı inmesini (diff_y > 0) istemiyoruz, bu "el indirme" olur.
+                        # Ama TİD Merhaba'da el yana doğru açılırken hafif aşağı da inebilir, o yüzden 
+                        # sadece "kafa hizasından uzaklaşma" mantığına bakıyoruz.
+                        
+                        is_moving_up = diff_y < 0
+                        is_moving_side = diff_x > (MIN_MOVEMENT * 0.8) # Yana hareket
+
+                        if is_moving_up or is_moving_side:
+                            print(f"✅ MERHABA ALGILANDI! (Hareket: {move_total:.1f})")
+                            del MOBILE_SESSIONS[sid]
+                            return jsonify({"detected": True, "message": "✅ Merhaba!", "final": True})
+                        else:
+                            msg = "Hareketi Tamamla (Yukarı/Yana)"
+                    
+                    # Eğer el kafadan çok uzaklaştıysa ve hareket algılanmadıysa sıfırla
+                    elif not is_close_to_head and move_total > face_height:
+                         st["start_pos"] = None
+                         msg = "Tekrar Dene"
+
+            # Döngü bitti, eğer return olmadıysa:
+            return jsonify({"detected": False, "message": msg, "final": False})
+
         else:
-            msg = "Yüz/El Görülmedi"
-
-    return jsonify({"detected": False, "message": msg, "final": False})
-
-@app.route('/gesture_mobile/end', methods=['POST'])
-def end():
-    sid = request.form.get("session_id")
-    if sid in MOBILE_SESSIONS: del MOBILE_SESSIONS[sid]
-    return jsonify({"ok": True})
+            return jsonify({"detected": False, "message": "Yüz/El Görülmedi", "final": False})
 
 # ==========================================
 # 2. BÖLÜM: SES KISMI (DOKUNULMADI)
 # ==========================================
 @app.route('/check_speech_audio', methods=['POST'])
 def audio():
-    # Dosya kontrolü
-    if 'file' not in request.files: 
-        print("❌ Hata: Ses dosyası gelmedi.")
-        return jsonify({"detected": False, "message": "Dosya yok"})
-    
+    if 'file' not in request.files: return jsonify({"detected": False, "message": "Dosya yok"})
     file = request.files['file']
     path = f"temp_{uuid4()}.wav"
     file.save(path)
-    
-    print(f"🎤 Ses dosyası alındı, işleniyor...")
-
     r = sr.Recognizer()
     msg = "..."
     detected = False
-    
     try:
         with sr.AudioFile(path) as s:
-            # Sesi oku
             audio_data = r.record(s)
-            
-            # Google'a sor
             t = r.recognize_google(audio_data, language="tr-TR").lower()
             print(f"🗣️ Algılanan: {t}")
-
-            # Kelime kontrolü
             if "merhaba" in t or "maraba" in t or "meraba" in t:
                 detected = True
                 msg = f"✅ {t}"
-                print("✅ SES KOMUTU BAŞARILI: Merhaba denildi.")
             else:
                 msg = f"Anlaşılan: {t}"
-                print(f"❌ Eşleşmedi: {t}")
-
-    except sr.UnknownValueError:
-        msg = "Ses anlaşılamadı"
-        print("❌ Google sesi anlayamadı.")
     except Exception as e:
-        msg = f"Hata: {e}"
-        print(f"❌ Hata: {e}")
-    
-    # Temizlik
+        msg = "Ses anlaşılamadı"
     if os.path.exists(path): os.remove(path)
-    
     return jsonify({"detected": detected, "message": msg})
 
 if __name__ == '__main__':
-    print("🚀 UNIFIED SERVER HAZIR (Jest V8 + Ses)...")
+    print("🚀 UNIFIED SERVER V13 HAZIR...")
     app.run(host='0.0.0.0', port=5000, threaded=True)
