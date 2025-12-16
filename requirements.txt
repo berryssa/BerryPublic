@@ -1,7 +1,6 @@
 Flask
 gunicorn
 opencv-python-headless
-mediapipe
-SpeechRecognition
+mediapipe==0.10.9
 numpy
-Werkzeug
+SpeechRecognition
