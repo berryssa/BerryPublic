@@ -1,5 +1,5 @@
-# unified_server.py - V25: ŞAKAK + ALIN DESTEKLİ TİD MERHABA
-# Elin şakağa (kaş bitimine) konulmasını da destekler.
+# unified_server.py - V26: DAHA SERİ HAREKET ALGILAMA
+# Kapatıp açınca hata vermeyen sistem için optimize edildi.
 
 from flask import Flask, jsonify, request
 import cv2
@@ -14,12 +14,12 @@ import speech_recognition as sr
 app = Flask(__name__)
 
 # ==========================================
-# AYARLAR
+# AYARLAR (GÜNCELLENDİ)
 # ==========================================
 ROTATE_FIX = True       
-# Eşik: Yüz boyunun %60'ı kadar yakınlık yeterli (Çünkü artık tam noktaya bakıyoruz)
 PROXIMITY_THRESHOLD = 0.6  
-MIN_MOVEMENT = 20          
+# DEĞİŞİKLİK: 20 -> 15 (Daha küçük hareketleri de kabul et, daha seri hissettirir)
+MIN_MOVEMENT = 15          
 FINGER_THRESHOLD = 0.08    
 MAX_SESSION_TIME = 120      
 
@@ -30,17 +30,14 @@ def get_face(): return mp_face.FaceMesh(max_num_faces=1, refine_landmarks=True, 
 def get_hands(): return mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5)
 
 def calc_dist(p1, p2): return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-
-def calc_dist_3d(p1, p2):
-    return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+def calc_dist_3d(p1, p2): return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
 
 def are_fingers_together(hand_landmarks):
     tips = [8, 12, 16, 20]
     for i in range(len(tips) - 1):
         p1 = hand_landmarks.landmark[tips[i]]
         p2 = hand_landmarks.landmark[tips[i+1]]
-        if calc_dist_3d(p1, p2) > FINGER_THRESHOLD:
-            return False 
+        if calc_dist_3d(p1, p2) > FINGER_THRESHOLD: return False 
     return True
 
 MOBILE_SESSIONS = {}
@@ -48,11 +45,7 @@ MOBILE_SESSIONS = {}
 @app.route('/gesture_mobile/start', methods=['POST'])
 def start():
     sid = str(uuid4())
-    MOBILE_SESSIONS[sid] = {
-        "t0": time.time(), 
-        "start_pos": None,
-        "state": "WAITING_HAND" 
-    }
+    MOBILE_SESSIONS[sid] = { "t0": time.time(), "start_pos": None, "state": "WAITING_HAND" }
     return jsonify({"ok": True, "session_id": sid})
 
 @app.route('/gesture_mobile/frame', methods=['POST'])
@@ -89,42 +82,26 @@ def frame():
             if f_res.multi_face_landmarks and h_res.multi_hand_landmarks:
                 face = f_res.multi_face_landmarks[0]
                 
-                # --- REFERANS NOKTALARI (GÜNCELLENDİ) ---
-                # Artık sadece alın ortasına değil, şakaklara da bakıyoruz.
+                # Referanslar (Orta Alın, Sağ Şakak, Sol Şakak)
+                ref_points = [face.landmark[10], face.landmark[334], face.landmark[105]]
                 
-                # 1. Alın Ortası (Landmark 10)
-                # 2. Sol Kaş Sonu / Şakak (Landmark 334 civarı)
-                # 3. Sağ Kaş Sonu / Şakak (Landmark 105 civarı)
-                
-                ref_points = [
-                    face.landmark[10],  # Orta
-                    face.landmark[334], # Sol Şakak
-                    face.landmark[105]  # Sağ Şakak
-                ]
-                
-                # Yüz boyu referansı (Çene - Alın arası)
                 chin = face.landmark[152]
                 forehead = face.landmark[10]
                 face_height = calc_dist((forehead.x*w, forehead.y*h), (chin.x*w, chin.y*h))
 
-                # EN İYİ ELİ BUL
                 active_hand = None
                 best_dist = 9999
                 
                 for hand in h_res.multi_hand_landmarks:
                     if not are_fingers_together(hand): continue 
-
                     index_tip = hand.landmark[8]
                     ix, iy = int(index_tip.x * w), int(index_tip.y * h)
                     
-                    # Elin, HERHANGİ BİR referans noktasına (Alın veya Şakaklar) uzaklığına bak
-                    # En yakın olduğu noktayı baz alacağız.
                     min_dist_to_refs = 9999
                     for ref in ref_points:
                         rx, ry = int(ref.x * w), int(ref.y * h)
                         d = calc_dist((ix, iy), (rx, ry))
-                        if d < min_dist_to_refs:
-                            min_dist_to_refs = d
+                        if d < min_dist_to_refs: min_dist_to_refs = d
                     
                     if min_dist_to_refs < best_dist:
                         best_dist = min_dist_to_refs
@@ -133,41 +110,29 @@ def frame():
                 if active_hand:
                     index_tip = active_hand.landmark[8]
                     ix, iy = int(index_tip.x * w), int(index_tip.y * h)
-                    
-                    # Mesafe Kontrolü (En yakın referans noktasına göre)
                     is_close = best_dist < (face_height * PROXIMITY_THRESHOLD)
 
-                    # --- DURUM MAKİNESİ ---
                     if st["start_pos"] is None:
                         if is_close:
                             st["start_pos"] = (ix, iy) 
                             msg = "Hazır! Selam Ver..."
                         else:
-                            msg = "Elini Şakağına/Alnına Koy"
-                    
+                            msg = "Elini Başına Getir"
                     else:
                         start_ix, start_iy = st["start_pos"]
                         move_total = calc_dist((ix, iy), (start_ix, start_iy))
                         msg = f"Takipte... M:{move_total:.0f}"
 
-                        # Hareketin Yönü (Opsiyonel Kontrol)
-                        # Şakaktan YUKARI veya YANA (Dışarı) olması beklenir.
-                        # Aşağı doğru (y artışı) hareketleri eleyebiliriz ama şimdilik esnek bırakıyorum.
-                        
                         if move_total > MIN_MOVEMENT:
                             detected_status = True
                             msg = "✅ Merhaba!"
                             final_decision = True
                             del MOBILE_SESSIONS[sid]
-                        
                         elif not is_close and move_total > face_height * 1.5:
                              st["start_pos"] = None
                              msg = "Tekrar Dene"
                 else:
-                    if h_res.multi_hand_landmarks and not active_hand:
-                         msg = "Parmaklarını Birleştir"
-                    else:
-                         msg = "Elini Başına Getir"
+                    msg = "El/Parmak Düzelt" if h_res.multi_hand_landmarks else "Elini Başına Getir"
 
             else:
                 msg = "Yüz/El Görülmedi"
@@ -198,9 +163,9 @@ def audio():
             t = r.recognize_google(audio_data, language="tr-TR").lower()
             if "merhaba" in t or "maraba" in t or "selam" in t:
                 detected = True
-                msg = f"✅ Algılandı: {t}"
+                msg = f"✅ {t}"
             else:
-                msg = f"Farklı: {t}"
+                msg = f"{t}"
     except:
         msg = "Anlaşılamadı"
     if os.path.exists(path): os.remove(path)
