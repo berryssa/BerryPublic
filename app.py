@@ -1,5 +1,5 @@
-# unified_server.py - V24: HER İKİ EL, GENİŞ ALAN, TİD UYUMLU
-# Sağ/Sol el fark etmez, kafa üstü/şakak fark etmez.
+# unified_server.py - V25: ŞAKAK + ALIN DESTEKLİ TİD MERHABA
+# Elin şakağa (kaş bitimine) konulmasını da destekler.
 
 from flask import Flask, jsonify, request
 import cv2
@@ -14,12 +14,11 @@ import speech_recognition as sr
 app = Flask(__name__)
 
 # ==========================================
-# AYARLAR (SENİN İSTEKLERİNE GÖRE GÜNCELLENDİ)
+# AYARLAR
 # ==========================================
 ROTATE_FIX = True       
-# Eşik Arttırıldı: 1.0 = Yüzün boyu kadar mesafe. 
-# Bu, elini kafanın tepesine de koysan, şakağa da koysan algılamasını sağlar.
-PROXIMITY_THRESHOLD = 1.0  
+# Eşik: Yüz boyunun %60'ı kadar yakınlık yeterli (Çünkü artık tam noktaya bakıyoruz)
+PROXIMITY_THRESHOLD = 0.6  
 MIN_MOVEMENT = 20          
 FINGER_THRESHOLD = 0.08    
 MAX_SESSION_TIME = 120      
@@ -28,7 +27,6 @@ mp_face = mp.solutions.face_mesh
 mp_hands = mp.solutions.hands
 
 def get_face(): return mp_face.FaceMesh(max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5)
-# GÜNCELLEME: max_num_hands=2 yapıldı. İki el de ekrandaysa ikisine de bakar.
 def get_hands(): return mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5)
 
 def calc_dist(p1, p2): return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
@@ -36,7 +34,6 @@ def calc_dist(p1, p2): return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 def calc_dist_3d(p1, p2):
     return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
 
-# PARMAK BİTİŞİK Mİ?
 def are_fingers_together(hand_landmarks):
     tips = [8, 12, 16, 20]
     for i in range(len(tips) - 1):
@@ -92,70 +89,81 @@ def frame():
             if f_res.multi_face_landmarks and h_res.multi_hand_landmarks:
                 face = f_res.multi_face_landmarks[0]
                 
-                # Yüz Referansları
-                forehead = face.landmark[10]
-                chin = face.landmark[152]
-                face_height = calc_dist((forehead.x*w, forehead.y*h), (chin.x*w, chin.y*h))
-                fx, fy = int(forehead.x * w), int(forehead.y * h)
-
-                # --- ÇOKLU EL DESTEĞİ ---
-                # Ekrandaki tüm ellere bak, hangisi "aktif" ise onu kullan.
-                active_hand = None
+                # --- REFERANS NOKTALARI (GÜNCELLENDİ) ---
+                # Artık sadece alın ortasına değil, şakaklara da bakıyoruz.
                 
-                # Önce alına en yakın ve parmakları bitişik olan eli bulalım
+                # 1. Alın Ortası (Landmark 10)
+                # 2. Sol Kaş Sonu / Şakak (Landmark 334 civarı)
+                # 3. Sağ Kaş Sonu / Şakak (Landmark 105 civarı)
+                
+                ref_points = [
+                    face.landmark[10],  # Orta
+                    face.landmark[334], # Sol Şakak
+                    face.landmark[105]  # Sağ Şakak
+                ]
+                
+                # Yüz boyu referansı (Çene - Alın arası)
+                chin = face.landmark[152]
+                forehead = face.landmark[10]
+                face_height = calc_dist((forehead.x*w, forehead.y*h), (chin.x*w, chin.y*h))
+
+                # EN İYİ ELİ BUL
+                active_hand = None
                 best_dist = 9999
                 
                 for hand in h_res.multi_hand_landmarks:
-                    # 1. Parmak kontrolü (Tüm eller için şart)
                     if not are_fingers_together(hand): continue 
 
                     index_tip = hand.landmark[8]
                     ix, iy = int(index_tip.x * w), int(index_tip.y * h)
-                    dist = calc_dist((ix, iy), (fx, fy))
                     
-                    # Eğer bu el alına, diğerinden daha yakınsa bunu seç
-                    if dist < best_dist:
-                        best_dist = dist
+                    # Elin, HERHANGİ BİR referans noktasına (Alın veya Şakaklar) uzaklığına bak
+                    # En yakın olduğu noktayı baz alacağız.
+                    min_dist_to_refs = 9999
+                    for ref in ref_points:
+                        rx, ry = int(ref.x * w), int(ref.y * h)
+                        d = calc_dist((ix, iy), (rx, ry))
+                        if d < min_dist_to_refs:
+                            min_dist_to_refs = d
+                    
+                    if min_dist_to_refs < best_dist:
+                        best_dist = min_dist_to_refs
                         active_hand = hand
 
-                # Eğer uygun bir el bulunduysa işlemlere devam et
                 if active_hand:
                     index_tip = active_hand.landmark[8]
                     ix, iy = int(index_tip.x * w), int(index_tip.y * h)
                     
-                    # Mesafe Kontrolü (Genişletilmiş Alan: Kafa üstü dahil)
+                    # Mesafe Kontrolü (En yakın referans noktasına göre)
                     is_close = best_dist < (face_height * PROXIMITY_THRESHOLD)
 
                     # --- DURUM MAKİNESİ ---
-                    
-                    # DURUM 1: Başlangıç
                     if st["start_pos"] is None:
                         if is_close:
                             st["start_pos"] = (ix, iy) 
                             msg = "Hazır! Selam Ver..."
                         else:
-                            # Eğer uygun el var ama uzaktaysa
-                            msg = "Elini Başına Getir"
+                            msg = "Elini Şakağına/Alnına Koy"
                     
-                    # DURUM 2: Hareket Takibi
                     else:
                         start_ix, start_iy = st["start_pos"]
                         move_total = calc_dist((ix, iy), (start_ix, start_iy))
                         msg = f"Takipte... M:{move_total:.0f}"
 
+                        # Hareketin Yönü (Opsiyonel Kontrol)
+                        # Şakaktan YUKARI veya YANA (Dışarı) olması beklenir.
+                        # Aşağı doğru (y artışı) hareketleri eleyebiliriz ama şimdilik esnek bırakıyorum.
+                        
                         if move_total > MIN_MOVEMENT:
-                            # HAREKET BAŞARILI (Yön fark etmeksizin uzaklaşma)
                             detected_status = True
                             msg = "✅ Merhaba!"
                             final_decision = True
                             del MOBILE_SESSIONS[sid]
                         
-                        # Hata durumu: El çok uzaklaştı ama hareket sayılmadı
                         elif not is_close and move_total > face_height * 1.5:
                              st["start_pos"] = None
                              msg = "Tekrar Dene"
                 else:
-                    # El var ama parmaklar bitişik değilse veya çok uzaktaysa
                     if h_res.multi_hand_landmarks and not active_hand:
                          msg = "Parmaklarını Birleştir"
                     else:
